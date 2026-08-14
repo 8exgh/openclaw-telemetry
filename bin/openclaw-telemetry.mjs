@@ -14,6 +14,11 @@
  * ~/.openclaw-telemetry/status.json with any of:
  *   { "status": "ok"|"warn"|"error", "model": "...", "tokens": {...},
  *     "errors": [...], "note": "...", "extra": {...} }
+ *
+ * Zero-prompt installs: set OPENCLAW_TELEMETRY_TOKEN and
+ * OPENCLAW_TELEMETRY_CLAW (or CLAW_USERNAME) in the environment and every
+ * command works without a config file; OPENCLAW_TELEMETRY_URL overrides
+ * the default home. Environment beats the config file key by key.
  */
 
 import { spawn } from "node:child_process";
@@ -23,7 +28,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const DIR = path.join(os.homedir(), ".openclaw-telemetry");
 const CONFIG = path.join(DIR, "config.json");
 const STATUS = path.join(DIR, "status.json");
@@ -72,6 +77,17 @@ function normalizeUrl(input) {
   let url = input.trim();
   if (!/^https?:\/\//.test(url)) url = "https://" + url;
   return url.replace(/\/+$/, "");
+}
+
+/* Environment beats the config file, key by key. Returns null when no
+   complete configuration exists either way. */
+function loadConfig() {
+  const file = readJson(CONFIG) ?? {};
+  const url = process.env.OPENCLAW_TELEMETRY_URL || file.url || DEFAULT_URL;
+  const token = process.env.OPENCLAW_TELEMETRY_TOKEN || file.token;
+  const claw = process.env.OPENCLAW_TELEMETRY_CLAW || process.env.CLAW_USERNAME || file.claw;
+  if (!token || !claw) return null;
+  return { url: normalizeUrl(url), token, claw };
 }
 
 async function setup() {
@@ -134,9 +150,9 @@ async function send(config, lastError) {
 }
 
 async function runLoop() {
-  const config = readJson(CONFIG);
+  const config = loadConfig();
   if (!config) {
-    console.error("Not configured. Run: openclaw-telemetry");
+    console.error("Not configured. Run: openclaw-telemetry (or set OPENCLAW_TELEMETRY_TOKEN and OPENCLAW_TELEMETRY_CLAW)");
     process.exit(1);
   }
   ensureDir();
@@ -205,7 +221,7 @@ function stop() {
 }
 
 function status() {
-  const config = readJson(CONFIG);
+  const config = loadConfig();
   let pid = null;
   try {
     pid = runningPid();
@@ -238,9 +254,9 @@ switch (cmd) {
     status();
     break;
   case "once": {
-    const config = readJson(CONFIG);
+    const config = loadConfig();
     if (!config) {
-      console.error("Not configured. Run: openclaw-telemetry");
+      console.error("Not configured. Run: openclaw-telemetry (or set OPENCLAW_TELEMETRY_TOKEN and OPENCLAW_TELEMETRY_CLAW)");
       process.exit(1);
     }
     send(config, null)
@@ -274,8 +290,7 @@ switch (cmd) {
     break;
   default: {
     (async () => {
-      let config = readJson(CONFIG);
-      if (!config) config = await setup();
+      if (!loadConfig()) await setup();
       start();
     })();
   }

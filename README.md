@@ -34,6 +34,19 @@ openclaw-telemetry setup    # change URL / key / claw name
 Admins issue access keys from the Fleet tab at
 [8examples.com/account](https://8examples.com/account).
 
+## Zero-prompt installs
+
+Set the environment instead and no config file or prompt is needed —
+this is how managed OpenClaw containers run it by default:
+
+```
+OPENCLAW_TELEMETRY_TOKEN=oct_...        # required
+OPENCLAW_TELEMETRY_CLAW=openclaw1       # or CLAW_USERNAME
+OPENCLAW_TELEMETRY_URL=https://8examples.com/openclaw/telemetry   # optional, this is the default
+```
+
+Environment variables beat the config file key by key.
+
 ## What it sends
 
 `POST <url>` with `Authorization: Bearer <key>`:
