@@ -3,7 +3,7 @@
 Call-home telemetry reporter for [OpenClaw AI workers](https://8examples.com/openclaw).
 Installs globally, asks where home is once, then runs a background job that
 phones in one imprint every 10 minutes: status, model, token usage, errors,
-and host health.
+browser health, and host health.
 
 ## Install and run
 
@@ -71,7 +71,8 @@ Environment variables beat the config file key by key.
         "memFreeMB": 2048,
         "memTotalMB": 8192
       },
-      "agent": { "name": "openclaw-telemetry", "version": "0.1.0" }
+      "browser": { "ok": true, "bin": "chromium", "url": "https://example.com/", "ms": 850 },
+      "agent": { "name": "openclaw-telemetry", "version": "0.2.0" }
     }
   ]
 }
@@ -95,6 +96,22 @@ so the worker (or anything else on the machine) can keep it current:
 
 `status` may be `ok`, `warn`, or `error`; it drives the color of the claw's
 tile on the fleet dashboard.
+
+## Browser health check
+
+Every imprint also exercises the machine's web browser: the reporter finds a
+Chromium-family binary on `PATH` (chromium, google-chrome, brave, edge, …),
+headless-loads a page that should always work — `https://example.com/` by
+default — and verifies HTML comes back within 30 seconds. The result is
+reported as the `browser` field above; a failure (no binary, launch error,
+timeout, or an empty page) also appends a `browser: ...` line to `errors`,
+which turns the claw's tile amber unless the claw has set its own `status`.
+
+```
+OPENCLAW_TELEMETRY_BROWSER=off                  # disable the check
+OPENCLAW_TELEMETRY_BROWSER=/usr/bin/chromium    # or force a specific binary
+OPENCLAW_TELEMETRY_BROWSER_URL=https://...      # load this page instead
+```
 
 ## Surviving reboots
 

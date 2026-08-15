@@ -15,6 +15,12 @@
  *   { "status": "ok"|"warn"|"error", "model": "...", "tokens": {...},
  *     "errors": [...], "note": "...", "extra": {...} }
  *
+ * Each imprint also exercises the web browser: headless-load a page that
+ * should always work (default https://example.com/) and verify HTML comes
+ * back. Failures are appended to `errors`; the result rides along as a
+ * `browser` field. OPENCLAW_TELEMETRY_BROWSER picks the binary ("off"
+ * disables the check); OPENCLAW_TELEMETRY_BROWSER_URL overrides the page.
+ *
  * Zero-prompt installs: set OPENCLAW_TELEMETRY_TOKEN and
  * OPENCLAW_TELEMETRY_CLAW (or CLAW_USERNAME) in the environment and every
  * command works without a config file; OPENCLAW_TELEMETRY_URL overrides
@@ -28,7 +34,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 const DIR = path.join(os.homedir(), ".openclaw-telemetry");
 const CONFIG = path.join(DIR, "config.json");
 const STATUS = path.join(DIR, "status.json");
@@ -107,10 +113,108 @@ async function setup() {
   return { url, token, claw };
 }
 
-function imprint(config, lastError) {
+const BROWSER_CHECK_URL = process.env.OPENCLAW_TELEMETRY_BROWSER_URL || "https://example.com/";
+const BROWSER_CHECK_TIMEOUT_MS = 30 * 1000;
+const BROWSER_CANDIDATES = [
+  "chromium",
+  "chromium-browser",
+  "google-chrome",
+  "google-chrome-stable",
+  "chrome",
+  "brave-browser",
+  "microsoft-edge",
+];
+
+function findBrowser() {
+  const chosen = process.env.OPENCLAW_TELEMETRY_BROWSER;
+  if (chosen) return chosen;
+  const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const name of BROWSER_CANDIDATES) {
+    for (const dir of dirs) {
+      const candidate = path.join(dir, name);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch {
+        /* keep looking */
+      }
+    }
+  }
+  return null;
+}
+
+/* Headless-load a page that should always work and verify HTML comes back.
+   Resolves to { ok, bin, url, ms, error? }, or null when disabled. Never
+   rejects. */
+function checkBrowser() {
+  return new Promise((resolve) => {
+    if (/^(off|none|0|false)$/i.test(process.env.OPENCLAW_TELEMETRY_BROWSER ?? "")) {
+      return resolve(null);
+    }
+    const bin = findBrowser();
+    if (!bin) {
+      return resolve({
+        ok: false,
+        url: BROWSER_CHECK_URL,
+        error: "no browser binary found (set OPENCLAW_TELEMETRY_BROWSER)",
+      });
+    }
+    const name = path.basename(bin);
+    const started = Date.now();
+    /* --no-sandbox matches how OpenClaw containers launch the browser. */
+    const child = spawn(
+      bin,
+      ["--headless", "--disable-gpu", "--no-sandbox", "--dump-dom", BROWSER_CHECK_URL],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    let out = "";
+    let errOut = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({
+        ok: false,
+        bin: name,
+        url: BROWSER_CHECK_URL,
+        ms: Date.now() - started,
+        error: `page load timed out after ${BROWSER_CHECK_TIMEOUT_MS / 1000}s`,
+      });
+    }, BROWSER_CHECK_TIMEOUT_MS);
+    child.stdout.on("data", (d) => {
+      if (out.length < 262144) out += d;
+    });
+    child.stderr.on("data", (d) => {
+      if (errOut.length < 8192) errOut += d;
+    });
+    child.on("error", (err) => {
+      finish({ ok: false, bin: name, url: BROWSER_CHECK_URL, error: `could not launch: ${err.message}` });
+    });
+    child.on("close", (code) => {
+      const ms = Date.now() - started;
+      if (code === 0 && /<html[\s>]/i.test(out)) {
+        return finish({ ok: true, bin: name, url: BROWSER_CHECK_URL, ms });
+      }
+      const lastLine = errOut.trim().split("\n").pop() ?? "";
+      const error =
+        code === 0
+          ? "page loaded but returned no HTML"
+          : `exit ${code}${lastLine ? `: ${lastLine.slice(0, 200)}` : ""}`;
+      finish({ ok: false, bin: name, url: BROWSER_CHECK_URL, ms, error });
+    });
+  });
+}
+
+function imprint(config, lastError, browser) {
   const clawStatus = readJson(STATUS) ?? {};
   const errors = Array.isArray(clawStatus.errors) ? [...clawStatus.errors] : [];
   if (lastError) errors.push(`telemetry: previous send failed: ${lastError}`);
+  if (browser && !browser.ok) errors.push(`browser: ${browser.error}`);
   return {
     claw: config.claw,
     at: new Date().toISOString(),
@@ -128,13 +232,14 @@ function imprint(config, lastError) {
       memFreeMB: Math.round(os.freemem() / 1048576),
       memTotalMB: Math.round(os.totalmem() / 1048576),
     },
+    ...(browser ? { browser } : {}),
     ...(clawStatus.extra ? { extra: clawStatus.extra } : {}),
     agent: { name: "openclaw-telemetry", version: VERSION },
   };
 }
 
-async function send(config, lastError) {
-  const body = JSON.stringify({ claws: [imprint(config, lastError)] });
+async function send(config, lastError, browser) {
+  const body = JSON.stringify({ claws: [imprint(config, lastError, browser)] });
   const res = await fetch(config.url, {
     method: "POST",
     headers: {
@@ -160,8 +265,16 @@ async function runLoop() {
   log(`run: pid ${process.pid}, reporting ${config.claw} -> ${config.url} every 10m`);
   let lastError = null;
   const tick = async () => {
+    const browser = await checkBrowser();
+    if (browser) {
+      log(
+        browser.ok
+          ? `browser ok: ${browser.bin} loaded ${browser.url} in ${browser.ms}ms`
+          : `browser check failed: ${browser.error}`
+      );
+    }
     try {
-      await send(config, lastError);
+      await send(config, lastError, browser);
       log(`sent imprint for ${config.claw}`);
       lastError = null;
     } catch (err) {
@@ -259,12 +372,17 @@ switch (cmd) {
       console.error("Not configured. Run: openclaw-telemetry (or set OPENCLAW_TELEMETRY_TOKEN and OPENCLAW_TELEMETRY_CLAW)");
       process.exit(1);
     }
-    send(config, null)
-      .then(() => console.log("sent"))
-      .catch((err) => {
+    (async () => {
+      const browser = await checkBrowser();
+      if (browser && !browser.ok) console.error(`browser check failed: ${browser.error}`);
+      try {
+        await send(config, null, browser);
+        console.log("sent");
+      } catch (err) {
         console.error("send failed:", err.message);
         process.exit(1);
-      });
+      }
+    })();
     break;
   }
   case "setup":
