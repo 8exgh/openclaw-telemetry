@@ -99,8 +99,9 @@ tile on the fleet dashboard.
 
 ## Browser health check
 
-Every imprint also exercises the machine's web browser: the reporter finds a
-Chromium-family binary on `PATH` (chromium, google-chrome, brave, edge, …),
+Every imprint also exercises the machine's web browser: the reporter uses
+OpenClaw's configured browser path first, then searches `PATH` and Playwright's
+shared browser cache for Chromium, Chrome, Brave, or Edge,
 headless-loads a page that should always work — `https://example.com/` by
 default — and verifies HTML comes back within 30 seconds. The result is
 reported as the `browser` field above; a failure (no binary, launch error,
@@ -112,6 +113,30 @@ OPENCLAW_TELEMETRY_BROWSER=off                  # disable the check
 OPENCLAW_TELEMETRY_BROWSER=/usr/bin/chromium    # or force a specific binary
 OPENCLAW_TELEMETRY_BROWSER_URL=https://...      # load this page instead
 ```
+
+Run `openclaw-telemetry browser-check` to print the discovery/launch result
+without sending an imprint.
+
+## Portmap check
+
+Each claw instance is expected to be reachable at its own subdomain —
+`<claw>.fusenv.com` — for inbound webhooks (e.g. phone-gateway pings). Every
+imprint verifies that mapping actually routes: the reporter requests
+`https://<claw>.fusenv.com` and treats any HTTP answer except `404` as
+mapped (tunnel and wildcard-DNS catch-alls answer 404; a real claw gateway
+answers 200/401/…). No response at all (NXDOMAIN, timeout, TLS failure)
+also fails the check. The result is reported as the `portmap` field; a
+failure appends a `portmap: ...` line to `errors`, turning the tile amber
+until the tunnel ingress + DNS record exist.
+
+```
+OPENCLAW_TELEMETRY_PORTMAP=off                     # disable the check
+OPENCLAW_TELEMETRY_PORTMAP=claw7.example.com       # check this hostname instead
+OPENCLAW_TELEMETRY_PORTMAP_DOMAIN=example.com      # keep <claw>. but change the domain
+```
+
+Run `openclaw-telemetry portmap-check` to print the result without sending
+an imprint.
 
 ## Surviving reboots
 

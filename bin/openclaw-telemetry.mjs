@@ -34,7 +34,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const DIR = path.join(os.homedir(), ".openclaw-telemetry");
 const CONFIG = path.join(DIR, "config.json");
 const STATUS = path.join(DIR, "status.json");
@@ -128,6 +128,17 @@ const BROWSER_CANDIDATES = [
 function findBrowser() {
   const chosen = process.env.OPENCLAW_TELEMETRY_BROWSER;
   if (chosen) return chosen;
+  // Managed OpenClaw containers deliberately keep Chromium outside PATH.
+  // Prefer the same executable/wrapper the OpenClaw browser plugin uses.
+  const openClawBrowser = process.env.OPENCLAW_BROWSER_EXECUTABLE_PATH;
+  if (openClawBrowser) {
+    try {
+      fs.accessSync(openClawBrowser, fs.constants.X_OK);
+      return openClawBrowser;
+    } catch {
+      /* fall through to Playwright's shared browser cache */
+    }
+  }
   const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
   for (const name of BROWSER_CANDIDATES) {
     for (const dir of dirs) {
@@ -137,6 +148,37 @@ function findBrowser() {
         return candidate;
       } catch {
         /* keep looking */
+      }
+    }
+  }
+  const playwrightRoots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    path.join(os.homedir(), ".cache", "ms-playwright"),
+    "/opt/ms-playwright",
+  ].filter(Boolean);
+  const relativeExecutables = [
+    ["chrome-linux64", "chrome"],
+    ["chrome-linux", "chrome"],
+    ["chrome-headless-shell-linux64", "chrome-headless-shell"],
+    ["chrome-headless-shell-linux", "chrome-headless-shell"],
+  ];
+  for (const root of [...new Set(playwrightRoots)]) {
+    let revisions;
+    try {
+      revisions = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    } catch {
+      continue;
+    }
+    for (const revision of revisions) {
+      if (!/^chromium/.test(revision.name)) continue;
+      for (const parts of relativeExecutables) {
+        const candidate = path.join(root, revision.name, ...parts);
+        try {
+          fs.accessSync(candidate, fs.constants.X_OK);
+          return candidate;
+        } catch {
+          /* keep looking */
+        }
       }
     }
   }
@@ -210,11 +252,61 @@ function checkBrowser() {
   });
 }
 
-function imprint(config, lastError, browser) {
+const PORTMAP_DEFAULT_DOMAIN = "fusenv.com";
+const PORTMAP_TIMEOUT_MS = 10_000;
+
+/* Each claw instance gets its own subdomain: <claw>.fusenv.com. Override the
+   full target with OPENCLAW_TELEMETRY_PORTMAP (or disable with "off"); change
+   just the domain with OPENCLAW_TELEMETRY_PORTMAP_DOMAIN. */
+function portmapTarget(claw) {
+  const override = process.env.OPENCLAW_TELEMETRY_PORTMAP ?? "";
+  if (/^(off|none|0|false)$/i.test(override)) return null;
+  if (override) return override.includes("://") ? override : `https://${override}`;
+  if (!claw) return null;
+  const domain = process.env.OPENCLAW_TELEMETRY_PORTMAP_DOMAIN || PORTMAP_DEFAULT_DOMAIN;
+  return `https://${claw}.${domain}`;
+}
+
+/* Verify the claw's public hostname actually routes somewhere: tunnel and
+   wildcard catch-alls answer 404, a mapped claw gateway answers anything
+   else. Resolves to { ok, url, status?, ms, error? }, or null when disabled.
+   Never rejects. */
+async function checkPortmap(claw) {
+  const url = portmapTarget(claw);
+  if (!url) return null;
+  const started = Date.now();
+  try {
+    const res = await fetch(url, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(PORTMAP_TIMEOUT_MS),
+    });
+    const ms = Date.now() - started;
+    if (res.status === 404) {
+      return {
+        ok: false,
+        url,
+        status: 404,
+        ms,
+        error: "hostname resolves but is not mapped to this claw (catch-all 404): check the tunnel ingress + DNS record",
+      };
+    }
+    return { ok: true, url, status: res.status, ms };
+  } catch (err) {
+    const ms = Date.now() - started;
+    const error =
+      err?.name === "TimeoutError" || err?.name === "AbortError"
+        ? `no response within ${PORTMAP_TIMEOUT_MS / 1000}s`
+        : err?.cause?.code ?? err?.message ?? String(err);
+    return { ok: false, url, ms, error };
+  }
+}
+
+function imprint(config, lastError, browser, portmap) {
   const clawStatus = readJson(STATUS) ?? {};
   const errors = Array.isArray(clawStatus.errors) ? [...clawStatus.errors] : [];
   if (lastError) errors.push(`telemetry: previous send failed: ${lastError}`);
   if (browser && !browser.ok) errors.push(`browser: ${browser.error}`);
+  if (portmap && !portmap.ok) errors.push(`portmap: ${portmap.url}: ${portmap.error}`);
   return {
     claw: config.claw,
     at: new Date().toISOString(),
@@ -233,13 +325,14 @@ function imprint(config, lastError, browser) {
       memTotalMB: Math.round(os.totalmem() / 1048576),
     },
     ...(browser ? { browser } : {}),
+    ...(portmap ? { portmap } : {}),
     ...(clawStatus.extra ? { extra: clawStatus.extra } : {}),
     agent: { name: "openclaw-telemetry", version: VERSION },
   };
 }
 
-async function send(config, lastError, browser) {
-  const body = JSON.stringify({ claws: [imprint(config, lastError, browser)] });
+async function send(config, lastError, browser, portmap) {
+  const body = JSON.stringify({ claws: [imprint(config, lastError, browser, portmap)] });
   const res = await fetch(config.url, {
     method: "POST",
     headers: {
@@ -273,8 +366,16 @@ async function runLoop() {
           : `browser check failed: ${browser.error}`
       );
     }
+    const portmap = await checkPortmap(config.claw);
+    if (portmap) {
+      log(
+        portmap.ok
+          ? `portmap ok: ${portmap.url} answered ${portmap.status} in ${portmap.ms}ms`
+          : `portmap check failed: ${portmap.url}: ${portmap.error}`
+      );
+    }
     try {
-      await send(config, lastError, browser);
+      await send(config, lastError, browser, portmap);
       log(`sent imprint for ${config.claw}`);
       lastError = null;
     } catch (err) {
@@ -375,14 +476,31 @@ switch (cmd) {
     (async () => {
       const browser = await checkBrowser();
       if (browser && !browser.ok) console.error(`browser check failed: ${browser.error}`);
+      const portmap = await checkPortmap(config.claw);
+      if (portmap && !portmap.ok) console.error(`portmap check failed: ${portmap.url}: ${portmap.error}`);
       try {
-        await send(config, null, browser);
+        await send(config, null, browser, portmap);
         console.log("sent");
       } catch (err) {
         console.error("send failed:", err.message);
         process.exit(1);
       }
     })();
+    break;
+  }
+  case "browser-check":
+    checkBrowser().then((browser) => {
+      console.log(JSON.stringify(browser));
+      if (browser && !browser.ok) process.exitCode = 1;
+    });
+    break;
+  case "portmap-check": {
+    const claw =
+      process.env.OPENCLAW_TELEMETRY_CLAW || process.env.CLAW_USERNAME || loadConfig()?.claw;
+    checkPortmap(claw).then((portmap) => {
+      console.log(JSON.stringify(portmap));
+      if (portmap && !portmap.ok) process.exitCode = 1;
+    });
     break;
   }
   case "setup":
@@ -397,6 +515,8 @@ switch (cmd) {
         "",
         "  openclaw-telemetry          set up if needed, then start the background job",
         "  openclaw-telemetry once     send a single imprint now",
+        "  openclaw-telemetry browser-check  test browser discovery and launch",
+        "  openclaw-telemetry portmap-check  verify <claw>.fusenv.com routes to this claw",
         "  openclaw-telemetry status   show the daemon and its recent sends",
         "  openclaw-telemetry stop     stop the background job",
         "  openclaw-telemetry setup    re-run configuration",

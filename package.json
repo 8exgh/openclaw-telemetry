@@ -1,11 +1,14 @@
 {
   "name": "openclaw-telemetry",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Call-home telemetry reporter for OpenClaw AI workers. Phones imprints (status, model, token usage, errors, browser health, host health) to your 8Examples telemetry endpoint every 10 minutes.",
   "license": "MIT",
   "type": "module",
   "bin": {
     "openclaw-telemetry": "bin/openclaw-telemetry.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
   },
   "files": [
     "bin",
